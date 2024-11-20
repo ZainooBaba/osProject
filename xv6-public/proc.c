@@ -17,8 +17,10 @@ static struct proc *initproc;
 int nextpid = 1;
 extern void forkret(void);
 extern void trapret(void);
+extern uchar ref_counts[];
 
 static void wakeup1(void *chan);
+
 
 void
 pinit(void)
@@ -208,14 +210,33 @@ fork(void)
       np->ofile[i] = filedup(curproc->ofile[i]);
   np->cwd = idup(curproc->cwd);
 
+  np->wmap_num = curproc->wmap_num;
+  for(i = 0; i < curproc->wmap_num; i++) {
+    np->wmaps[i] = curproc->wmaps[i];
+    if(np->wmaps[i].f) { np->wmaps[i].f = filedup(curproc->wmaps[i].f); }
+    if(np->wmaps[i].flags & MAP_SHARED) {
+      for(uint addr = PGROUNDDOWN(np->wmaps[i].addr); addr < PGROUNDUP(np->wmaps[i].addr + np->wmaps[i].length); addr += PGSIZE) {
+        pte_t *pte = walkpgdir(curproc->pgdir, (void*)addr, 0);
+        if(pte && (*pte & PTE_P)) {
+          inc_ref_counts(PTE_ADDR(*pte));
+          if(mappages(np->pgdir, (void*)addr, PGSIZE, PTE_ADDR(*pte), PTE_FLAGS(*pte)) < 0) {
+            if(np->pgdir) { freevm(np->pgdir); }
+            kfree(np->kstack);
+            np->kstack = 0;
+            np->state = UNUSED;
+            return -1;
+          }
+        }
+      }
+    }
+  }
+
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
 
   pid = np->pid;
 
   acquire(&ptable.lock);
-
   np->state = RUNNABLE;
-
   release(&ptable.lock);
 
   return pid;
@@ -240,6 +261,17 @@ exit(void)
       fileclose(curproc->ofile[fd]);
       curproc->ofile[fd] = 0;
     }
+  }
+  for (int i = 0; i < curproc->wmap_num; i++) {
+    struct wmap_block *block = &curproc->wmaps[i];
+      for (uint va = block->addr; va < block->addr + PGROUNDUP(block->length); va += PGSIZE) {
+          pte_t *pte = walkpgdir(curproc->pgdir, (void *)va, 0);
+          if (pte && (*pte & PTE_P)) {
+              uint pa = PTE_ADDR(*pte);
+              kfree((char *)P2V(pa));
+              *pte = 0;
+          }
+      }
   }
 
   begin_op();

@@ -1,4 +1,5 @@
 // Per-CPU state
+#include "wmap.h"
 struct cpu {
   uchar apicid;                // Local APIC ID
   struct context *scheduler;   // swtch() here to enter scheduler
@@ -34,6 +35,13 @@ struct context {
 
 enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+struct wmap_block {
+    uint addr;
+    int flags;
+    int length;
+    int fd;
+    struct file *f;
+};
 // Per-process state
 struct proc {
   uint sz;                     // Size of process memory (bytes)
@@ -49,6 +57,8 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  struct wmap_block wmaps[MAX_WMAPS];
+  int wmap_num;
 };
 
 // Process memory is laid out contiguously, low addresses first:

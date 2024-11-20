@@ -6,13 +6,17 @@
 #include "proc.h"
 #include "x86.h"
 #include "traps.h"
+#include "fs.h" 
 #include "spinlock.h"
+#include "sleeplock.h"
+#include "file.h"
 
 // Interrupt descriptor table (shared by all CPUs).
 struct gatedesc idt[256];
 extern uint vectors[];  // in vectors.S: array of 256 entry pointers
 struct spinlock tickslock;
 uint ticks;
+extern uchar ref_counts[];
 
 void
 tvinit(void)
@@ -77,6 +81,71 @@ trap(struct trapframe *tf)
             cpuid(), tf->cs, tf->eip);
     lapiceoi();
     break;
+
+  case T_PGFLT: {
+    uint fault_address = rcr2();
+    struct proc *p = myproc();
+    pte_t *pte = walkpgdir(p->pgdir, (void*)fault_address, 0);
+    if (pte && (*pte & PTE_P) && (*pte & PTE_COW)) {
+      uint pa = PTE_ADDR(*pte);
+      if (ref_counts[pa / PGSIZE] > 1) {
+        char *mem = kalloc();
+        if (!mem) {
+          p->killed = 1;
+          return;
+        }
+        memmove(mem, (char*)P2V(pa), PGSIZE);
+        uint flags = PTE_FLAGS(*pte);
+        flags |= PTE_W;
+        flags &= ~PTE_COW;
+        *pte = V2P(mem) | flags;
+        dec_ref_counts(pa);
+      } else {
+        *pte |= PTE_W;
+        *pte &= ~PTE_COW;
+      }
+      lcr3(V2P(p->pgdir));
+      return;
+    }
+
+    int not_seg = 0;
+    for (int i = 0; i < p->wmap_num; i++) {
+      struct wmap_block *block = &p->wmaps[i];
+      uint start = block->addr;
+      uint end = start + PGROUNDUP(block->length);
+      if (fault_address >= start && fault_address < end) {
+        uint a = PGROUNDDOWN(fault_address);
+        char *mem = kalloc();
+        if (mem == 0) {
+          cprintf("mem error\n");
+          p->killed = 1;
+          break;
+        }
+        memset(mem, 0, PGSIZE);
+        if (mappages(p->pgdir, (char*)a, PGSIZE, V2P(mem), PTE_W | PTE_U) < 0) {
+          kfree(mem);
+          cprintf("mappages error\n");
+          p->killed = 1;
+          break;
+        }
+        if (block->f) {
+          block->f->off = a - start;
+          if (fileread(block->f, mem, PGSIZE) < 0) {
+            cprintf("file read error\n");
+            p->killed = 1;
+            break;
+          }
+        }
+        not_seg = 1;
+        break;
+      }
+    }
+    if (!not_seg) {
+      cprintf("Segmentation Fault\n");
+      p->killed = 1;
+      break;
+    }
+  }
 
   //PAGEBREAK: 13
   default:

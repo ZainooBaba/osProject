@@ -12,6 +12,7 @@
 void freerange(void *vstart, void *vend);
 extern char end[]; // first address after kernel loaded from ELF file
                    // defined by the kernel linker script in kernel.ld
+uchar ref_counts[PHYSTOP / PGSIZE];
 
 struct run {
   struct run *next;
@@ -22,6 +23,22 @@ struct {
   int use_lock;
   struct run *freelist;
 } kmem;
+
+void
+inc_ref_counts(uint pa)
+{
+    acquire(&kmem.lock);
+    ref_counts[pa / PGSIZE]++;
+    release(&kmem.lock);
+}
+
+void
+dec_ref_counts(uint pa)
+{
+    acquire(&kmem.lock);
+    if(ref_counts[pa / PGSIZE] > 0) { ref_counts[pa / PGSIZE]--; }
+    release(&kmem.lock);
+}
 
 // Initialization happens in two phases.
 // 1. main() calls kinit1() while still using entrypgdir to place just
@@ -48,8 +65,10 @@ freerange(void *vstart, void *vend)
 {
   char *p;
   p = (char*)PGROUNDUP((uint)vstart);
-  for(; p + PGSIZE <= (char*)vend; p += PGSIZE)
+  for(; p + PGSIZE <= (char*)vend; p += PGSIZE) {
+    ref_counts[V2P(p) / PGSIZE] = 0;
     kfree(p);
+  }
 }
 //PAGEBREAK: 21
 // Free the page of physical memory pointed at by v,
@@ -64,14 +83,21 @@ kfree(char *v)
   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(v, 1, PGSIZE);
-
   if(kmem.use_lock)
     acquire(&kmem.lock);
   r = (struct run*)v;
-  r->next = kmem.freelist;
-  kmem.freelist = r;
+
+  if(ref_counts[V2P(v) / PGSIZE] > 0) {
+    --ref_counts[V2P(v) / PGSIZE];
+  }
+  
+  if (ref_counts[V2P(v) / PGSIZE] == 0) {
+    // Fill with junk to catch dangling refs.
+    memset(v, 1, PGSIZE);
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+  }
+
   if(kmem.use_lock)
     release(&kmem.lock);
 }
@@ -87,8 +113,10 @@ kalloc(void)
   if(kmem.use_lock)
     acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r) {
     kmem.freelist = r->next;
+    ref_counts[V2P((char*)r) / PGSIZE] = 1;
+  }
   if(kmem.use_lock)
     release(&kmem.lock);
   return (char*)r;

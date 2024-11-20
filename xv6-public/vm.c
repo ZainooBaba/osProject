@@ -6,6 +6,10 @@
 #include "mmu.h"
 #include "proc.h"
 #include "elf.h"
+#include "fs.h" 
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "file.h"
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
@@ -32,7 +36,7 @@ seginit(void)
 // Return the address of the PTE in page table pgdir
 // that corresponds to virtual address va.  If alloc!=0,
 // create any required page table pages.
-static pte_t *
+pte_t *
 walkpgdir(pde_t *pgdir, const void *va, int alloc)
 {
   pde_t *pde;
@@ -57,7 +61,7 @@ walkpgdir(pde_t *pgdir, const void *va, int alloc)
 // Create PTEs for virtual addresses starting at va that refer to
 // physical addresses starting at pa. va and size might not
 // be page-aligned.
-static int
+int
 mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
 {
   char *a, *last;
@@ -195,10 +199,14 @@ inituvm(pde_t *pgdir, char *init, uint sz)
 // Load a program segment into pgdir.  addr must be page-aligned
 // and the pages from addr to addr+sz must already be mapped.
 int
-loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz)
+loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz, uint perm)
 {
   uint i, pa, n;
   pte_t *pte;
+
+  int flags = PTE_U; // Pages are user-accessible
+  if (perm & ELF_PROG_FLAG_WRITE)
+    flags |= PTE_W; // Set writable flag if the segment is writable
 
   if((uint) addr % PGSIZE != 0)
     panic("loaduvm: addr must be page aligned");
@@ -212,6 +220,9 @@ loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz)
       n = PGSIZE;
     if(readi(ip, P2V(pa), offset+i, n) != n)
       return -1;
+
+    // Update PTE with correct permissions
+    *pte = (pa | flags | PTE_P);
   }
   return 0;
 }
@@ -312,13 +323,12 @@ clearpteu(pde_t *pgdir, char *uva)
 
 // Given a parent process's page table, create a copy
 // of it for a child.
-pde_t*
+pde_t* 
 copyuvm(pde_t *pgdir, uint sz)
 {
   pde_t *d;
   pte_t *pte;
   uint pa, i, flags;
-  char *mem;
 
   if((d = setupkvm()) == 0)
     return 0;
@@ -327,15 +337,20 @@ copyuvm(pde_t *pgdir, uint sz)
       panic("copyuvm: pte should exist");
     if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
+      
     pa = PTE_ADDR(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
+    if(flags & PTE_W){
+      flags &= ~PTE_W;
+      flags |= PTE_COW;
+      *pte = pa | flags; 
     }
+    
+    if(mappages(d, (void*)i, PGSIZE, pa, flags) < 0)
+      goto bad;
+
+    inc_ref_counts(pa);
+    lcr3(V2P(pgdir));
   }
   return d;
 
@@ -384,6 +399,106 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
   }
   return 0;
 }
+
+uint
+wmap(uint addr, int length, int flags, int fd)
+{
+  struct proc *p = myproc();
+  if (p->wmap_num >= MAX_WMAPS || addr % PGSIZE != 0 || addr < 0x60000000 || addr >= 0x80000000) { return -1; }
+  for (int i = 0; i < p->wmap_num; i++) {
+    struct wmap_block *curr_block = &p->wmaps[i];
+    if (!(addr + length <= curr_block->addr || addr >= curr_block->addr + curr_block->length)) {
+      return -1;
+    }
+  }
+  struct wmap_block *block = &p->wmaps[p->wmap_num];
+  block->addr = addr;
+  block->length = length;
+  block->flags = flags;
+  block->fd = -1;
+  block->f = 0;
+  if (!(flags & MAP_ANONYMOUS)) {
+    struct file *f = p->ofile[fd];
+    if (!f || f->type != FD_INODE) { return -1; }
+    filedup(f);
+    block->f = f;
+    block->fd = fd;    
+  }
+  p->wmap_num++;
+  return addr;
+}
+
+int
+wunmap(uint addr)
+{
+  if (addr < 0x60000000 || addr >= 0x80000000) { return -1; }
+  struct proc *p = myproc();
+    
+  for (int i = 0; i < p->wmap_num; i++) {
+    struct wmap_block *block = &p->wmaps[i];
+    if (block->addr == addr) {
+      uint start = block->addr;
+      uint end = start + PGROUNDUP(block->length);
+      for (uint a = start; a < end; a += PGSIZE) {
+        pte_t *pte = walkpgdir(p->pgdir, (void*)a, 0);
+        if (pte && (*pte & PTE_P)) {
+          char *mem = P2V(PTE_ADDR(*pte));
+          if ((block->flags & MAP_SHARED) && block->f) {
+            block->f->off = a - start;
+            if (filewrite(block->f, mem, PGSIZE) != PGSIZE) {
+              cprintf("file error\n");
+              p->killed = 1;
+              return -1;
+            }
+          }
+          kfree(mem);
+          *pte = 0;
+        }
+      }
+      memmove(&p->wmaps[i], &p->wmaps[i+1], sizeof(struct wmap_block)*(p->wmap_num - i -1));
+      p->wmap_num--;
+      if (block->f) { fileclose(block->f); }
+      return 0;
+    }
+  }
+  return -1;
+}
+
+uint
+va2pa(uint va)
+{
+  struct proc *p = myproc();
+  if (!p || !p->pgdir) { return (uint)-1; }
+  pte_t *pte = walkpgdir(p->pgdir, (const void *)va, 0);
+  if (!pte || !(*pte & PTE_P)) { return (uint)-1; }
+  uint pa = PTE_ADDR(*pte);
+  return pa | (va & 0xFFF);
+}
+
+int getwmapinfo(struct wmapinfo *wminfo)
+{
+  struct wmapinfo info;
+  memset(&info, 0, sizeof(info));
+  struct proc *p = myproc();
+  info.total_mmaps = p->wmap_num;
+
+  for (int i = 0; i < p->wmap_num && i < MAX_WMMAP_INFO; i++) {
+    struct wmap_block *block = &p->wmaps[i];
+    info.addr[i] = block->addr;
+    info.length[i] = block->length;
+    uint start = block->addr;
+    uint end = start + PGROUNDUP(block->length);
+    int count = 0;
+    for (uint a = start; a < end; a += PGSIZE) {
+      pte_t *pte = walkpgdir(p->pgdir, (void*)a, 0);
+      if (pte && (*pte & PTE_P)) { count++; }
+    }
+    info.n_loaded_pages[i] = count;
+  }
+  if (copyout(p->pgdir, (uint)wminfo, &info, sizeof(info)) < 0) { return -1; }
+  return 0;
+}
+
 
 //PAGEBREAK!
 // Blank page.
